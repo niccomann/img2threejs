@@ -29,9 +29,12 @@ REVIEWED_REGION_PREFIX = "reviewed:"
 MIN_REGION_POINTS = 64
 MAX_PROFILE_STATIONS = 24
 PROFILE_AXES = {"x": 0, "y": 1, "z": 2}
-# Radial extent at a station is the 95th percentile of the in-plane distance from the region's
-# axis, not the maximum: a single stray vertex would otherwise set the whole station.
-PROFILE_RADIUS_PERCENTILE = 95.0
+# Radial extent at a station: the band is split into angular sectors around the region's axis,
+# the outermost point of each occupied sector is taken, and the station radius is the median
+# of those sector maxima. A plain percentile over all band points underestimates a capped
+# shell (the bottom disc of an islet fills the band with interior vertices), while a raw
+# maximum lets a single stray vertex set the whole station.
+PROFILE_SECTORS = 24
 
 
 def inventory_boundaries(
@@ -151,8 +154,12 @@ def _profile(points: np.ndarray, axis: str, stations: int) -> list[list[float]]:
         selected = points[np.abs(points[:, index] - station) <= half_band]
         if len(selected) < 3:
             continue
-        radial = np.linalg.norm(selected[:, lateral] - center, axis=1)
-        records.append([float(station), float(np.percentile(radial, PROFILE_RADIUS_PERCENTILE))])
+        offsets = selected[:, lateral] - center
+        radial = np.linalg.norm(offsets, axis=1)
+        angles = np.arctan2(offsets[:, 1], offsets[:, 0])
+        sector = np.floor((angles + np.pi) / (2 * np.pi) * PROFILE_SECTORS).astype(int) % PROFILE_SECTORS
+        maxima = [float(radial[sector == s].max()) for s in range(PROFILE_SECTORS) if np.any(sector == s)]
+        records.append([float(station), float(np.median(maxima))])
     return records
 
 

@@ -29,6 +29,10 @@ from forge.stage1_intake.check_dense_evidence import validate_dense_evidence
 # geometry. Every dimensional change below is mirrored onto the matching `transform.scale`
 # axis, recorded as its own derived change so the reverse delta restores both.
 DERIVED_SCALE_FIELDS = ("transform.scale.0", "transform.scale.1", "transform.scale.2")
+DERIVED_ATTACHMENT_FIELDS = (
+    "attachment.localStart.0", "attachment.localStart.1", "attachment.localStart.2",
+    "attachment.localEnd.0", "attachment.localEnd.1", "attachment.localEnd.2",
+)
 GLOBAL_NUMERIC_FIELDS = frozenset(
     {
         "dimensions.width",
@@ -40,6 +44,7 @@ GLOBAL_NUMERIC_FIELDS = frozenset(
         "transform.position.1",
         "transform.position.2",
         *DERIVED_SCALE_FIELDS,
+        *DERIVED_ATTACHMENT_FIELDS,
     }
 )
 # Fields a component map may permit (mirror of check_dense_evidence.COMPONENT_FIELDS) plus the
@@ -56,9 +61,24 @@ COMPONENT_NUMERIC_FIELDS = frozenset(
         "attachment.baseRadius",
         "attachment.endRadius",
         *DERIVED_SCALE_FIELDS,
+        *DERIVED_ATTACHMENT_FIELDS,
+        "transform.position.0",
+        "transform.position.1",
+        "transform.position.2",
     }
 )
-COMPONENT_PERMITTED_FIELDS = COMPONENT_NUMERIC_FIELDS - frozenset(DERIVED_SCALE_FIELDS)
+COMPONENT_PERMITTED_FIELDS = frozenset(
+    {
+        "dimensions.width",
+        "dimensions.height",
+        "dimensions.depth",
+        "dimensions.radius",
+        "dimensions.length",
+        "geometryDescriptor.latheProfile.radii",
+        "attachment.baseRadius",
+        "attachment.endRadius",
+    }
+)
 AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
 
 
@@ -212,6 +232,97 @@ def _set_change(
     changes.append(change)
 
 
+# Primitives whose geometry the generator derives from `attachment.localStart/localEnd` and
+# `attachment.baseRadius/endRadius` (mirror of validate_sculpt_spec.ATTACHMENT_PRIMITIVES).
+# For them `dimensions` and `transform.scale` are documentation: a height change has to move
+# localEnd and a radius change has to move the two radii, or the proposal never renders.
+ATTACHMENT_PRIMITIVES = frozenset({"cylinder", "cone", "capsule", "tube", "curve-sweep"})
+
+
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _children_of(proposal: dict[str, object], component_id: str) -> list[tuple[dict[str, Any], list[object]]]:
+    """Direct children: flat `parent` references and nested `children` lists alike."""
+    result: list[tuple[dict[str, Any], list[object]]] = []
+    for item, path, _world in _components(proposal):
+        if item.get("parent") == component_id:
+            result.append((item, path))
+    parent_entry = next(((item, path) for item, path, _w in _components(proposal) if item.get("id") == component_id), None)
+    if parent_entry is not None:
+        nested = parent_entry[0].get("children")
+        if isinstance(nested, list):
+            for index, child in enumerate(nested):
+                if isinstance(child, dict) and child.get("parent") != component_id:
+                    result.append((child, [*parent_entry[1], "children", index]))
+    return result
+
+
+def _propagate_dimension_change(
+    proposal: dict[str, object],
+    component: dict[str, Any],
+    path: list[object],
+    axes: tuple[int, ...],
+    factor: float,
+    changes: list[dict[str, object]],
+    *,
+    scope: str,
+    measured: float,
+    confidence: float,
+    source_region: str,
+    derived_from: str,
+    radial: bool = False,
+) -> None:
+    """Carry a dimensional change of `factor` along `axes` into everything that renders it.
+
+    1. `transform.scale[axis]` -- the generator reads scale before dimensions.
+    2. Attachment-derived geometry: `attachment.localEnd[axis]` moves so the segment length
+       scales; a radial change (`dimensions.radius`) scales `attachment.baseRadius/endRadius`.
+    3. Direct children keep their proportional place on the part: their parent-local
+       `transform.position[axis]` and attachment `localStart/localEnd[axis]` scale too, so a
+       shorter tower brings its gallery, lantern and windows down with it.
+    Every write is its own derived, reversible change.
+    """
+    common = {"scope": scope, "measured": measured, "confidence": confidence, "source_region": source_region, "derived_from": derived_from}
+    transform = component.get("transform")
+    scale = transform.get("scale") if isinstance(transform, dict) else None
+    if isinstance(scale, list) and len(scale) == 3:
+        for axis in axes:
+            if _is_number(scale[axis]):
+                _set_change(component, path, f"transform.scale.{axis}", float(scale[axis]) * factor, changes, **common)
+    attachment = component.get("attachment")
+    if component.get("primitive") in ATTACHMENT_PRIMITIVES and isinstance(attachment, dict):
+        start, end = attachment.get("localStart"), attachment.get("localEnd")
+        if isinstance(start, list) and isinstance(end, list) and len(start) == 3 and len(end) == 3:
+            for axis in axes:
+                if _is_number(start[axis]) and _is_number(end[axis]) and not math.isclose(float(end[axis]), float(start[axis])):
+                    new_end = float(start[axis]) + (float(end[axis]) - float(start[axis])) * factor
+                    _set_change(component, path, f"attachment.localEnd.{axis}", new_end, changes, **common)
+        if radial:
+            for key in ("baseRadius", "endRadius"):
+                if _is_number(attachment.get(key)):
+                    _set_change(component, path, f"attachment.{key}", float(attachment[key]) * factor, changes, **common)
+    component_id = component.get("id")
+    if not isinstance(component_id, str):
+        return
+    for child, child_path in _children_of(proposal, component_id):
+        child_transform = child.get("transform")
+        position = child_transform.get("position") if isinstance(child_transform, dict) else None
+        if isinstance(position, list) and len(position) == 3:
+            for axis in axes:
+                if _is_number(position[axis]) and float(position[axis]) != 0.0:
+                    _set_change(child, child_path, f"transform.position.{axis}", float(position[axis]) * factor, changes, **common)
+        child_attachment = child.get("attachment")
+        if isinstance(child_attachment, dict):
+            for key in ("localStart", "localEnd"):
+                point = child_attachment.get(key)
+                if isinstance(point, list) and len(point) == 3:
+                    for axis in axes:
+                        if _is_number(point[axis]) and float(point[axis]) != 0.0:
+                            _set_change(child, child_path, f"attachment.{key}.{axis}", float(point[axis]) * factor, changes, **common)
+
+
 def _sync_transform_scale(
     component: dict[str, Any],
     path: list[object],
@@ -315,6 +426,19 @@ def _global_proposal(
             for axis in range(3):
                 if isinstance(position[axis], (int, float)) and not isinstance(position[axis], bool):
                     _set_change(component, path, f"transform.position.{axis}", float(position[axis]) * scale[axis], changes, scope="global-massing", measured=float(measured[axis]), confidence=0.8, source_region="global")
+        # Attachment-derived geometry lives in the segment and radii, not in dimensions.
+        attachment = component.get("attachment")
+        if component.get("primitive") in ATTACHMENT_PRIMITIVES and isinstance(attachment, dict):
+            for key in ("localStart", "localEnd"):
+                point = attachment.get(key)
+                if isinstance(point, list) and len(point) == 3:
+                    for axis in range(3):
+                        if _is_number(point[axis]) and float(point[axis]) != 0.0:
+                            _set_change(component, path, f"attachment.{key}.{axis}", float(point[axis]) * scale[axis], changes, scope="global-massing", measured=float(measured[axis]), confidence=0.8, source_region="global", derived_from="global-massing")
+            lateral = (scale[0] + scale[2]) / 2.0
+            for key in ("baseRadius", "endRadius"):
+                if _is_number(attachment.get(key)):
+                    _set_change(component, path, f"attachment.{key}", float(attachment[key]) * lateral, changes, scope="global-massing", measured=(float(measured[0]) + float(measured[2])) / 2.0, confidence=0.75, source_region="global", derived_from="global-massing")
     return scale
 
 
@@ -374,7 +498,7 @@ def _component_proposal(
                     continue
                 factor = bounded_ratio(size[axis], old, maximum_delta)
                 _set_change(component, path, field, old * factor, changes, measured=size[axis], **common)
-                _sync_transform_scale(component, path, (axis,), factor, changes, measured=size[axis], derived_from=field, **common)
+                _propagate_dimension_change(proposal, component, path, (axis,), factor, changes, measured=size[axis], derived_from=field, **common)
             elif field == "dimensions.radius":
                 # Mean of the region's lateral extents, halved: a cylinder's radius, robust to a
                 # slightly elliptical crop.
@@ -384,7 +508,7 @@ def _component_proposal(
                 measured = (size[0] + size[2]) / 4.0
                 factor = bounded_ratio(measured, old, maximum_delta)
                 _set_change(component, path, field, old * factor, changes, measured=measured, **common)
-                _sync_transform_scale(component, path, (0, 2), factor, changes, measured=measured, derived_from=field, **common)
+                _propagate_dimension_change(proposal, component, path, (0, 2), factor, changes, measured=measured, derived_from=field, radial=True, **common)
             elif field == "dimensions.length":
                 old = numeric(dimensions.get("length"))
                 if old is None:
@@ -393,7 +517,7 @@ def _component_proposal(
                 axis = AXIS_INDEX[str(dominant)] if dominant in AXIS_INDEX else max(range(3), key=lambda i: size[i])
                 factor = bounded_ratio(size[axis], old, maximum_delta)
                 _set_change(component, path, field, old * factor, changes, measured=size[axis], **common)
-                _sync_transform_scale(component, path, (axis,), factor, changes, measured=size[axis], derived_from=field, **common)
+                _propagate_dimension_change(proposal, component, path, (axis,), factor, changes, measured=size[axis], derived_from=field, **common)
             elif field == "geometryDescriptor.latheProfile.radii":
                 _lathe_profile_proposal(component, path, region, changes, maximum_delta, common)
             elif field in {"attachment.baseRadius", "attachment.endRadius"}:

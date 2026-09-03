@@ -64,6 +64,21 @@ def lighthouse_spec() -> dict[str, object]:
                 "dimensions": {"width": 0.5, "height": 0.5, "depth": 0.5},
                 "transform": {"position": [0.0, 8.0, 0.0], "rotation": [0.0, 0.0, 0.0], "scale": [0.5, 0.5, 0.5]},
             },
+            {
+                "id": "gallery-deck",
+                "primitive": "cylinder",
+                "parent": "lighthouse-tower",
+                "dimensions": {"width": 2.9, "height": 0.28, "depth": 2.9},
+                "transform": {"position": [0.0, 5.55, 0.0], "rotation": [0.0, 0.0, 0.0], "scale": [2.9, 0.28, 2.9]},
+                "attachment": {"localStart": [0.0, 5.55, 0.0], "localEnd": [0.0, 5.83, 0.0], "baseRadius": 1.45, "endRadius": 1.45},
+            },
+            {
+                "id": "tower-window",
+                "primitive": "box",
+                "parent": "lighthouse-tower",
+                "dimensions": {"width": 0.5, "height": 0.8, "depth": 0.14},
+                "transform": {"position": [0.68, 3.15, 0.99], "rotation": [0.0, 0.6, 0.0], "scale": [0.5, 0.8, 0.14]},
+            },
         ],
     }
 
@@ -276,15 +291,18 @@ class ComponentProposalTest(unittest.TestCase):
         self.assertAlmostEqual(tower["transform"]["scale"][2], 2.6 * (1.5 / 1.3), places=9)
         self.assertAlmostEqual(tower["transform"]["scale"][1], 5.6 * 1.2, places=9)
         self.assertEqual(dims["width"], 2.6)  # not permitted -> untouched
-        derived = [c for c in self.delta["changes"] if c.get("derivedFrom") == "dimensions.radius"]
-        self.assertEqual({c["field"] for c in derived}, {"transform.scale.0", "transform.scale.2"})
+        derived = {c["field"] for c in self.delta["changes"] if c.get("derivedFrom") == "dimensions.radius"}
+        self.assertTrue({"transform.scale.0", "transform.scale.2", "attachment.baseRadius", "attachment.endRadius"} <= derived, derived)
 
     def test_strut_radii_come_from_profile_ends(self) -> None:
+        # Permitted fields apply in order: dimensions.radius first (factor 1.5/1.3, mirrored
+        # onto both attachment radii), then the profile ends re-measure each radius against
+        # its already-scaled value: base 1.5 vs station 1.5 (no change), end 1.1538 vs
+        # station 0.9 (-22% -> clamped to -20%).
         attachment = self.changed["lighthouse-tower"]["attachment"]
-        self.assertAlmostEqual(attachment["baseRadius"], 1.3 * (1.5 / 1.3), places=9)  # low station 1.5
-        self.assertAlmostEqual(attachment["endRadius"], 1.0 * 0.9, places=9)  # high station 0.9
+        self.assertAlmostEqual(attachment["baseRadius"], 1.5, places=9)
+        self.assertAlmostEqual(attachment["endRadius"], 1.0 * (1.5 / 1.3) * 0.8, places=9)
         self.assertEqual(attachment["localStart"], [0.0, 1.9, 0.0])
-        self.assertEqual(attachment["localEnd"], [0.0, 7.5, 0.0])
 
     def test_length_uses_dominant_axis_and_is_bounded(self) -> None:
         dock = self.changed["dock-pier"]
@@ -319,8 +337,38 @@ class ComponentProposalTest(unittest.TestCase):
         # path = componentTree / i / geometryDescriptor / latheProfile / points / station / 0
         self.assertTrue(all(len(c["path"]) == 7 and c["path"][-1] == 0 for c in stations), stations)
 
-    def test_unmapped_component_is_untouched(self) -> None:
-        self.assertEqual(self.changed["finial-orb"], self.original["finial-orb"])
+    def test_unmapped_component_is_untouched_except_for_its_parent_frame(self) -> None:
+        # The finial rides on the tower: its own shape is untouched, its y offset follows the
+        # tower's height factor (1.2) so it still sits on top of a shorter/taller shaft.
+        finial = self.changed["finial-orb"]
+        self.assertEqual(finial["dimensions"], self.original["finial-orb"]["dimensions"])
+        self.assertEqual(finial["transform"]["scale"], self.original["finial-orb"]["transform"]["scale"])
+        self.assertAlmostEqual(finial["transform"]["position"][1], 8.0 * 1.2, places=9)
+
+    def test_height_change_reaches_the_attachment_segment_and_the_children(self) -> None:
+        tower = self.changed["lighthouse-tower"]
+        # the shaft geometry IS the segment: localEnd.y = start + 5.6 * 1.2
+        self.assertAlmostEqual(tower["attachment"]["localEnd"][1], 1.9 + 5.6 * 1.2, places=9)
+        self.assertEqual(tower["attachment"]["localStart"], [0.0, 1.9, 0.0])
+        deck = self.changed["gallery-deck"]
+        self.assertAlmostEqual(deck["transform"]["position"][1], 5.55 * 1.2, places=9)
+        self.assertAlmostEqual(deck["attachment"]["localStart"][1], 5.55 * 1.2, places=9)
+        self.assertAlmostEqual(deck["attachment"]["localEnd"][1], 5.83 * 1.2, places=9)
+        self.assertEqual(deck["dimensions"], self.original["gallery-deck"]["dimensions"])  # not mapped: own shape kept
+        window = self.changed["tower-window"]
+        self.assertAlmostEqual(window["transform"]["position"][1], 3.15 * 1.2, places=9)
+        # the radius factor (1.5/1.3) moved the window's lateral offset with the shaft surface
+        self.assertAlmostEqual(window["transform"]["position"][0], 0.68 * (1.5 / 1.3), places=9)
+        self.assertAlmostEqual(window["transform"]["position"][2], 0.99 * (1.5 / 1.3), places=9)
+        derived = {c["field"] for c in self.delta["changes"] if c.get("derivedFrom") == "dimensions.height"}
+        self.assertIn("attachment.localEnd.1", derived)
+        self.assertIn("transform.position.1", derived)
+
+    def test_every_derived_change_is_labelled_and_reversible(self) -> None:
+        derived = [c for c in self.delta["changes"] if "derivedFrom" in c]
+        self.assertTrue(derived)
+        self.assertTrue(all(c["field"] in COMPONENT_NUMERIC_FIELDS for c in derived))
+        self.assertEqual(apply_reverse_delta(self.proposal, self.delta), self.spec)
 
     def test_forbidden_field_is_rejected(self) -> None:
         mapping = component_map(self.evidence, self.spec)
