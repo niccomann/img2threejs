@@ -67,6 +67,129 @@ PASS_LEVELS = {
     "optimization-pass": {"macro", "meso", "micro"},
 }
 
+# repetitionSystems[].placement.mode. Anything else fails validation instead of silently
+# rendering as a radial ring (the pre-fix behaviour: `mode` was read, printed in a comment,
+# and then ignored by an instance loop that was always radial).
+REPETITION_PLACEMENT_MODES = ("radial", "linear", "grid")
+
+# component.surfaceDetail -> per-component material override. The five presets replace the
+# host material's `surfaceFrequencyBands` when the component's displacement/normal pattern
+# text names one of them (keyword match, so the prose that existing specs already carry --
+# "plank gaps", "stepped strata bands", "staggered slate tile rows" -- resolves without a
+# migration). Frequencies are in the same unit as authored bands (cycles per UV tile).
+SURFACE_DETAIL_PATTERN_BANDS: dict[str, list[dict[str, Any]]] = {
+    "stone": [
+        {"id": "macro", "frequency": 1.6, "amplitude": 0.46, "role": "block strata and ledges", "pattern": "ridge strata"},
+        {"id": "meso", "frequency": 9.0, "amplitude": 0.26, "role": "individual stones and mortar cracks", "pattern": "crack"},
+        {"id": "micro", "frequency": 48.0, "amplitude": 0.10, "role": "granular pitting"},
+    ],
+    "plank": [
+        {"id": "macro", "frequency": 3.0, "amplitude": 0.30, "role": "board-to-board height steps", "stretch": [1.0, 6.0], "pattern": "groove"},
+        {"id": "meso", "frequency": 14.0, "amplitude": 0.24, "role": "wood grain along the board", "stretch": [1.0, 8.0], "pattern": "grain"},
+        {"id": "micro", "frequency": 60.0, "amplitude": 0.08, "role": "splinter and weathering fibre", "stretch": [1.0, 4.0], "pattern": "fiber"},
+    ],
+    "shingle": [
+        {"id": "macro", "frequency": 5.0, "amplitude": 0.40, "role": "overlapping row steps", "stretch": [4.0, 1.0], "pattern": "ridge rows"},
+        {"id": "meso", "frequency": 18.0, "amplitude": 0.20, "role": "per-tile edge chips", "stretch": [1.5, 1.0]},
+        {"id": "micro", "frequency": 52.0, "amplitude": 0.07, "role": "slate flaking"},
+    ],
+    "plaster": [
+        {"id": "macro", "frequency": 1.2, "amplitude": 0.22, "role": "trowel sweeps"},
+        {"id": "meso", "frequency": 7.0, "amplitude": 0.18, "role": "stucco dabs"},
+        {"id": "micro", "frequency": 40.0, "amplitude": 0.12, "role": "sand grain"},
+    ],
+    "rope": [
+        {"id": "macro", "frequency": 6.0, "amplitude": 0.36, "role": "strand twist", "stretch": [1.0, 3.0], "pattern": "ridge"},
+        {"id": "meso", "frequency": 22.0, "amplitude": 0.22, "role": "yarn ridges", "stretch": [1.0, 3.0], "pattern": "fiber"},
+        {"id": "micro", "frequency": 70.0, "amplitude": 0.06, "role": "hemp fuzz"},
+    ],
+}
+
+_SURFACE_PATTERN_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("shingle", ("shingle", "tile", "slate", "roof")),
+    ("plaster", ("plaster", "stucco", "render", "trowel", "whitewash")),
+    ("plank", ("plank", "board", "wood", "deck", "timber")),
+    ("rope", ("rope", "twine", "cord", "hemp", "braid")),
+    ("stone", ("stone", "rock", "strata", "brick", "masonry", "boulder", "granite")),
+)
+
+
+def resolve_surface_pattern(surface_detail: dict[str, Any] | None) -> str | None:
+    """Return the preset name a component's surfaceDetail asks for, or None.
+
+    An explicit `preset` wins; otherwise the displacement/normal pattern prose is keyword-matched.
+    Prose that names nothing known (or "none") leaves the host material's bands untouched.
+    """
+    if not isinstance(surface_detail, dict):
+        return None
+    preset = surface_detail.get("preset")
+    if isinstance(preset, str) and preset in SURFACE_DETAIL_PATTERN_BANDS:
+        return preset
+    text = " ".join(
+        str(surface_detail.get(key) or "")
+        for key in ("displacementPattern", "normalPattern", "pattern")
+    ).lower()
+    if not text.strip() or text.strip() == "none":
+        return None
+    for name, keywords in _SURFACE_PATTERN_KEYWORDS:
+        if any(keyword in text for keyword in keywords):
+            return name
+    return None
+
+
+def surface_detail_material(material: dict[str, Any] | None, surface_detail: Any) -> dict[str, Any] | None:
+    """Merge a component's surfaceDetail into a copy of its host material spec.
+
+    Returns None when there is nothing to apply, so the caller keeps sharing the material
+    instance from `materialMap`. Mapping (all optional, numeric fields are clamped to 0..1):
+      microRoughness  -> roughness.variation
+      macroRoughness  -> roughness.base
+      bumpAmplitude   -> normal.strength / normal.amplitude (normalScale)
+      preset | displacementPattern | normalPattern -> surfaceFrequencyBands preset
+    """
+    if not isinstance(material, dict) or not isinstance(surface_detail, dict):
+        return None
+
+    def number(key: str) -> float | None:
+        value = surface_detail.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return max(0.0, min(1.0, float(value)))
+
+    micro = number("microRoughness")
+    macro = number("macroRoughness")
+    bump = number("bumpAmplitude")
+    preset = resolve_surface_pattern(surface_detail)
+    if not any(v is not None and v > 0 for v in (micro, macro, bump)) and preset is None:
+        return None
+
+    merged = json.loads(json.dumps(material))
+    roughness = merged.get("roughness")
+    if not isinstance(roughness, dict):
+        roughness = {"base": roughness} if isinstance(roughness, (int, float)) and not isinstance(roughness, bool) else {}
+    if micro is not None and micro > 0:
+        roughness["variation"] = round(micro, 4)
+    if macro is not None and macro > 0:
+        roughness["base"] = round(macro, 4)
+    if roughness:
+        merged["roughness"] = roughness
+    if bump is not None and bump > 0:
+        normal = merged.get("normal")
+        if not isinstance(normal, dict):
+            normal = {}
+        normal["strength"] = round(bump, 4)
+        normal["amplitude"] = round(bump, 4)
+        merged["normal"] = normal
+    if preset is not None:
+        merged["surfaceFrequencyBands"] = json.loads(json.dumps(SURFACE_DETAIL_PATTERN_BANDS[preset]))
+    merged["surfaceDetailOverride"] = {
+        "preset": preset,
+        "microRoughness": micro,
+        "macroRoughness": macro,
+        "bumpAmplitude": bump,
+    }
+    return merged
+
 
 def load_spec(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -3557,11 +3680,27 @@ def generate(spec: dict[str, Any], pass_id: str) -> str:
         endpoint_var = local_var("endpoint", component_id, index)
         material_id = str(component.get("material") or next(iter(materials.keys()), "base"))
         component_material = materials.get(material_id)
-        material_expression = (
-            f"createSculptMaterial({json.dumps(material_id)}, {json_literal(component_material)}, options, true)"
-            if component_uses_dense_height_maps(component) and component_material is not None
-            else f"materialMap[{json.dumps(material_id)}] ?? new THREE.MeshStandardMaterial({{ color: 0x888888 }})"
-        )
+        dense_component = component_uses_dense_height_maps(component) and component_material is not None
+        # surfaceDetail is a per-component override of the shared material: it used to be
+        # validated, to gate the surface-pass, and then to reach no emitted line at all. A
+        # component that declares it now gets its own material instance built from the host
+        # material merged with the override (see surface_detail_material).
+        detailed_material = surface_detail_material(component_material, component.get("surfaceDetail"))
+        if detailed_material is not None:
+            override = detailed_material["surfaceDetailOverride"]
+            material_expression = (
+                f"createSculptMaterial({json.dumps(f'{material_id}@{component_id}')}, "
+                f"{json_literal(detailed_material)}, options, {'true' if dense_component else 'false'})"
+                f" /* surfaceDetail override: preset={override['preset']} */"
+            )
+        elif dense_component:
+            material_expression = (
+                f"createSculptMaterial({json.dumps(material_id)}, {json_literal(component_material)}, options, true)"
+            )
+        else:
+            material_expression = (
+                f"materialMap[{json.dumps(material_id)}] ?? new THREE.MeshStandardMaterial({{ color: 0x888888 }})"
+            )
         parent = component.get("parent") or "root"
         name = str(component.get("name") or component_id)
         descriptor = component.get("geometryDescriptor")
@@ -3854,6 +3993,11 @@ def generate(spec: dict[str, Any], pass_id: str) -> str:
             parent_id = "root"
         placement = system.get("placement", {}) if isinstance(system.get("placement"), dict) else {}
         count = int(system.get("count") or 0)
+        if placement.get("mode") == "grid":
+            # A grid's count is nx * nz; `count` is optional and, when present, validated equal.
+            counts = placement.get("counts")
+            if isinstance(counts, list) and len(counts) == 2 and all(isinstance(c, int) and c > 0 for c in counts):
+                count = int(counts[0]) * int(counts[1])
         if count <= 0:
             continue
         primitive = str(system.get("primitive") or "box")
@@ -3865,7 +4009,87 @@ def generate(spec: dict[str, Any], pass_id: str) -> str:
         radius = placement.get("radius", 0.0)
         start_deg = placement.get("startAngleDeg", 0)
         mode = str(placement.get("mode") or "radial")
+        if mode not in REPETITION_PLACEMENT_MODES:
+            # validate_sculpt_spec rejects this before generation; keep codegen fail-closed too.
+            raise ValueError(
+                f"repetition system {system.get('id') or rep_index!r}: placement.mode {mode!r} is not one of "
+                f"{', '.join(REPETITION_PLACEMENT_MODES)}"
+            )
         rep_var = f"rep_{rep_index}"
+
+        def _number(value: Any, fallback: float) -> float:
+            return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else fallback
+
+        def _pair(value: Any, fallback: list[float]) -> list[float]:
+            if isinstance(value, list) and len(value) == 2 and all(
+                isinstance(v, (int, float)) and not isinstance(v, bool) for v in value
+            ):
+                return [float(value[0]), float(value[1])]
+            return fallback
+
+        grid_counts = [1, 1]
+        if mode == "grid":
+            counts = placement.get("counts")
+            if isinstance(counts, list) and len(counts) == 2 and all(isinstance(c, int) and c > 0 for c in counts):
+                grid_counts = [int(counts[0]), int(counts[1])]
+            # `count` is derived for a grid: nx * nz. Validation enforces agreement when both are set.
+            count = grid_counts[0] * grid_counts[1]
+        centered = placement.get("centered") is True
+        # Instance orientation for linear/grid rows: one shared Euler (radians, like component
+        # transform.rotation) so a plank row can lie flat and a mullion column stand upright.
+        instance_rotation = placement.get("rotation", [0, 0, 0])
+
+        if mode == "radial":
+            placement_lines = [
+                f"    const axis = new THREE.Vector3({vector(axis, [0, 0, 1])}).normalize();",
+                f"    const radius = {_number(radius, 0.0)};",
+                "    const seed = Math.abs(axis.z) < 0.9 ? new THREE.Vector3(0, 0, 1) : new THREE.Vector3(1, 0, 0);",
+                "    const perp = new THREE.Vector3().crossVectors(axis, seed).normalize();",
+                f"    for (let i = 0; i < {count}; i++) {{",
+                f"      const ang = (({_number(start_deg, 0.0)}) + (i * 360) / {count}) * Math.PI / 180;",
+                "      const dir = perp.clone().applyQuaternion(new THREE.Quaternion().setFromAxisAngle(axis, ang));",
+                "      _p.copy(radius > 0 ? dir.clone().multiplyScalar(radius * 0.5) : new THREE.Vector3());",
+                "      _q.setFromUnitVectors(new THREE.Vector3(1, 0, 0), dir);",
+                "      _m.compose(_p, _q, _s);",
+                "      cluster.setMatrixAt(i, _m);",
+                "    }",
+            ]
+        elif mode == "linear":
+            spacing = _number(placement.get("spacing"), 0.1)
+            placement_lines = [
+                f"    const step = new THREE.Vector3({vector(placement.get('axis', [1, 0, 0]), [1, 0, 0])}).normalize().multiplyScalar({spacing});",
+                f"    const origin = new THREE.Vector3({vector(placement.get('start', [0, 0, 0]), [0, 0, 0])});",
+                f"    if ({'true' if centered else 'false'}) origin.addScaledVector(step, -({count} - 1) / 2);",
+                f"    _q.setFromEuler(new THREE.Euler({vector(instance_rotation, [0, 0, 0])}));",
+                f"    for (let i = 0; i < {count}; i++) {{",
+                "      _p.copy(origin).addScaledVector(step, i);",
+                "      _m.compose(_p, _q, _s);",
+                "      cluster.setMatrixAt(i, _m);",
+                "    }",
+            ]
+        else:  # grid
+            axes = placement.get("axes") if isinstance(placement.get("axes"), list) else []
+            axis_a = axes[0] if len(axes) > 0 else [1, 0, 0]
+            axis_b = axes[1] if len(axes) > 1 else [0, 0, 1]
+            spacing_pair = _pair(placement.get("spacing"), [0.1, 0.1])
+            placement_lines = [
+                f"    const stepA = new THREE.Vector3({vector(axis_a, [1, 0, 0])}).normalize().multiplyScalar({spacing_pair[0]});",
+                f"    const stepB = new THREE.Vector3({vector(axis_b, [0, 0, 1])}).normalize().multiplyScalar({spacing_pair[1]});",
+                f"    const origin = new THREE.Vector3({vector(placement.get('start', [0, 0, 0]), [0, 0, 0])});",
+                f"    if ({'true' if centered else 'false'}) {{",
+                f"      origin.addScaledVector(stepA, -({grid_counts[0]} - 1) / 2);",
+                f"      origin.addScaledVector(stepB, -({grid_counts[1]} - 1) / 2);",
+                "    }",
+                f"    _q.setFromEuler(new THREE.Euler({vector(instance_rotation, [0, 0, 0])}));",
+                f"    for (let i = 0; i < {count}; i++) {{",
+                f"      const a = i % {grid_counts[0]};",
+                f"      const b = Math.floor(i / {grid_counts[0]});",
+                "      _p.copy(origin).addScaledVector(stepA, a).addScaledVector(stepB, b);",
+                "      _m.compose(_p, _q, _s);",
+                "      cluster.setMatrixAt(i, _m);",
+                "    }",
+            ]
+
         lines.extend(
             [
                 "",
@@ -3888,10 +4112,6 @@ def generate(spec: dict[str, Any], pass_id: str) -> str:
                 "    // `radial` ring's placement stays circular instead of being squashed into an",
                 "    // ellipse by a non-uniform host.",
                 f"    const scl = [{vector(scale, [0.1, 0.1, 0.1])}];",
-                f"    const axis = new THREE.Vector3({vector(axis, [0, 0, 1])}).normalize();",
-                f"    const radius = {float(radius) if isinstance(radius, (int, float)) else 0.0};",
-                "    const seed = Math.abs(axis.z) < 0.9 ? new THREE.Vector3(0, 0, 1) : new THREE.Vector3(1, 0, 0);",
-                "    const perp = new THREE.Vector3().crossVectors(axis, seed).normalize();",
                 "    // One InstancedMesh = one draw call for all repeated parts (teeth/fasteners/spokes),",
                 "    // replacing the former per-instance Mesh clone loop (real-time perf principle).",
                 f"    const cluster = new THREE.InstancedMesh(geo, mat, {count});",
@@ -3899,14 +4119,7 @@ def generate(spec: dict[str, Any], pass_id: str) -> str:
                 "    const _p = new THREE.Vector3();",
                 "    const _q = new THREE.Quaternion();",
                 "    const _s = new THREE.Vector3(scl[0], scl[1], scl[2]);",
-                f"    for (let i = 0; i < {count}; i++) {{",
-                f"      const ang = (({float(start_deg) if isinstance(start_deg,(int,float)) else 0.0}) + (i * 360) / {count}) * Math.PI / 180;",
-                "      const dir = perp.clone().applyQuaternion(new THREE.Quaternion().setFromAxisAngle(axis, ang));",
-                "      _p.copy(radius > 0 ? dir.clone().multiplyScalar(radius * 0.5) : new THREE.Vector3());",
-                "      _q.setFromUnitVectors(new THREE.Vector3(1, 0, 0), dir);",
-                "      _m.compose(_p, _q, _s);",
-                "      cluster.setMatrixAt(i, _m);",
-                "    }",
+                *placement_lines,
                 "    cluster.instanceMatrix.needsUpdate = true;",
                 "    cluster.castShadow = options.castShadow ?? true;",
                 "    cluster.receiveShadow = options.receiveShadow ?? true;",

@@ -585,6 +585,14 @@ ATTACHMENT_ROLES = {
 ATTACHMENT_PRIMITIVES = {"cylinder", "cone", "capsule", "tube", "curve-sweep"}
 
 
+# Mirrors of the generator's tables (forge/stage3_build/generate_threejs_factory.py):
+# REPETITION_PLACEMENT_MODES and SURFACE_DETAIL_PATTERN_BANDS. Kept literal here so the
+# validator stays import-free; test_repetition_placement_modes / test_surface_detail_emission
+# assert the two sides agree.
+REPETITION_PLACEMENT_MODES = ("radial", "linear", "grid")
+SURFACE_DETAIL_PRESETS = ("stone", "plank", "shingle", "plaster", "rope")
+
+
 def is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
@@ -1600,6 +1608,17 @@ def validate_components(
                 for field in ("macroRoughness", "microRoughness", "bumpAmplitude"):
                     if field in surface and not is_number(surface[field]):
                         errors.append(f"component {component_id!r} surfaceDetail.{field} must be numeric")
+                    elif field in surface and not (0 <= surface[field] <= 1):
+                        errors.append(f"component {component_id!r} surfaceDetail.{field} must be within 0..1")
+                for field in ("displacementPattern", "normalPattern", "pattern"):
+                    if field in surface and surface[field] is not None and not isinstance(surface[field], str):
+                        errors.append(f"component {component_id!r} surfaceDetail.{field} must be a string")
+                preset = surface.get("preset")
+                if preset is not None and preset not in SURFACE_DETAIL_PRESETS:
+                    errors.append(
+                        f"component {component_id!r} surfaceDetail.preset must be one of: "
+                        f"{', '.join(SURFACE_DETAIL_PRESETS)}"
+                    )
         evidence_refs = component.get("evidenceRefs")
         if evidence_refs is not None:
             validate_string_array(evidence_refs, f"component {component_id!r} evidenceRefs", errors)
@@ -2837,6 +2856,69 @@ def validate_component_frame_sanity(spec: dict[str, Any], warnings: list[str]) -
                 break
 
 
+def _is_vector(value: Any, size: int) -> bool:
+    return isinstance(value, list) and len(value) == size and all(is_number(v) for v in value)
+
+
+def _is_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def validate_repetition_systems(spec: dict[str, Any], errors: list[str], warnings: list[str]) -> None:
+    """Structural check of repetitionSystems[].placement.
+
+    Only object placements are checked (prose placements are legacy documentation and never
+    instanced by the generator). `mode` must be radial (default), linear or grid; the fields
+    each mode consumes must be well-formed so the emitted loop matches what was authored.
+    """
+    for index, system in enumerate(spec.get("repetitionSystems", []) or []):
+        if not isinstance(system, dict):
+            continue
+        label = f"repetitionSystems[{index}] ({system.get('id') or 'unnamed'})"
+        placement = system.get("placement")
+        if not isinstance(placement, dict):
+            continue
+        mode = placement.get("mode", "radial")
+        if mode not in REPETITION_PLACEMENT_MODES:
+            errors.append(
+                f"{label} placement.mode must be one of: {', '.join(REPETITION_PLACEMENT_MODES)}"
+            )
+            continue
+        if "rotation" in placement and not _is_vector(placement["rotation"], 3):
+            errors.append(f"{label} placement.rotation must be three numbers (radians)")
+        if "start" in placement and not _is_vector(placement["start"], 3):
+            errors.append(f"{label} placement.start must be three numbers")
+        if "centered" in placement and not isinstance(placement["centered"], bool):
+            errors.append(f"{label} placement.centered must be a boolean")
+        if mode == "radial":
+            if "axis" in placement and not _is_vector(placement["axis"], 3):
+                errors.append(f"{label} placement.axis must be three numbers")
+            if "radius" in placement and (not is_number(placement["radius"]) or placement["radius"] < 0):
+                errors.append(f"{label} placement.radius must be a non-negative number")
+            if "startAngleDeg" in placement and not is_number(placement["startAngleDeg"]):
+                errors.append(f"{label} placement.startAngleDeg must be numeric")
+        elif mode == "linear":
+            if "axis" in placement and not _is_vector(placement["axis"], 3):
+                errors.append(f"{label} placement.axis must be three numbers")
+            spacing = placement.get("spacing")
+            if not is_number(spacing) or spacing <= 0:
+                errors.append(f"{label} linear placement requires a positive numeric spacing")
+        else:  # grid
+            axes = placement.get("axes")
+            if not (isinstance(axes, list) and len(axes) == 2 and all(_is_vector(a, 3) for a in axes)):
+                errors.append(f"{label} grid placement requires axes: two 3-vectors")
+            counts = placement.get("counts")
+            if not (isinstance(counts, list) and len(counts) == 2 and all(_is_positive_int(c) for c in counts)):
+                errors.append(f"{label} grid placement requires counts: two positive integers")
+            elif "count" in system and system.get("count") != counts[0] * counts[1]:
+                errors.append(
+                    f"{label} count {system.get('count')!r} does not equal counts product {counts[0] * counts[1]}"
+                )
+            spacing = placement.get("spacing")
+            if not (isinstance(spacing, list) and len(spacing) == 2 and all(is_number(s) and s > 0 for s in spacing)):
+                errors.append(f"{label} grid placement requires spacing: two positive numbers")
+
+
 def validate_spec(spec: dict[str, Any]) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -2870,6 +2952,7 @@ def validate_spec(spec: dict[str, Any]) -> tuple[list[str], list[str]]:
     validate_pipeline_routing_contract(spec, errors)
     validate_cs2_view_dependent_environment(spec, errors)
     validate_components(spec, material_ids, evidence_ids, errors, warnings)
+    validate_repetition_systems(spec, errors, warnings)
     validate_component_frame_sanity(spec, warnings)
     lod_plan = spec.get("lodPlan")
     if lod_plan is not None and not isinstance(lod_plan, list):
