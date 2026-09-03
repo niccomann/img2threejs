@@ -1,4 +1,4 @@
-> Last updated: 2026-09-03 18:05
+> Last updated: 2026-09-03 21:45
 
 # Lighthouse Cove v2 — dense-evidence-driven detail pass
 
@@ -208,3 +208,40 @@ D. v2 spec authoring (§5.5) + A/B (§5.6 step 4).
 E. Pipeline 8/8 with visual gates, showcase regeneration, PR #62 update, docs.
 
 Estimated: A ≈ 1 h, B ≈ 1.5 h, C ≈ 0.5 h (plus provider wait), D ≈ 2 h, E ≈ 2 h.
+
+## 10. Outcome (2026-09-03)
+
+Executed A → E. Everything below was measured on the artifacts, not assumed.
+
+- **A. Generator** (`c550383`): `placement.mode` linear/grid implemented with validation and a
+  real-run matrix test; `surfaceDetail` emitted as per-component material overrides with five
+  presets. Two more generator defects surfaced during the passes and were fixed with tests:
+  emissive layers authored as `{color, intensity}` rendered black (`eced46b`), and — in the bridge —
+  a measured `dimensions` change never reached attachment-built geometry or the children
+  (`0b88ce8`).
+- **B. Bridge** (`87a1c77`, `0b88ce8`): reviewed region selectors (`--region-selectors`),
+  `reviewed-regions` semantic status, radius/length/lathe-profile/strut-radius measurements,
+  scale/attachment/children mirroring, sector-max profile estimator. 1240 → 1268 tests, all green.
+- **C. TRELLIS run**: one `hf-zerogpu-trellis` call (cost 0, 29,236 triangles, one merged node).
+  Visual review: recognisable diorama, but the lantern's light glow was reconstructed as a solid
+  fin, the boat is tucked under the dock and the lantern drum is squat. No rigid alignment met
+  both gates (best rigid view IoU 0.83, aspect error 0.28); following the house precedent the
+  alignment stretches 1.384× along the source view's horizontal axis (audited), giving IoU 0.828
+  (fin clipped; 0.679 raw) and aspect error 0.004. Ten reviewed regions were authored; five
+  components were mapped after checking each field against the source reading (tower height only —
+  radial fields excluded because of the audited stretch bias; cottage width only; islet width +
+  lathe profile; two rock slabs). The ≥ 8 mapped-components target was **not** met: the other
+  regions were either stretch-biased, rotated-part footprints or contradicted by the source.
+- **D. A/B**: round 1 (with islet depth +20%) regressed the source silhouette by 0.0385 → DENY
+  territory; per-mapping variants attributed it entirely to the islet depth; round 2 withdrew that
+  field → **ALLOW** (source IoU 0.600 → 0.624, massing similarity 0.597 → 0.744, all five gates).
+  TRELLIS's accepted contributions: tower −20% height (source agrees), cottage +20% width, outcrop
+  +20% width, islet lathe radii ±7%.
+- **E. Pipeline 8/8** on the accepted candidate: blockout 0.79, structural 0.80 after three
+  refine-spec rounds (torus scale/thickness, rock rounding, rotated-parent instancing → rail hub),
+  form 0.82, material 0.81, surface 0.81, lighting 0.81, interaction 0.82 (exact reset, pick,
+  door), optimization 0.82 at 62,328 triangles / 104 draw calls (standard tier; hero overshot at
+  213k). Final: 88 components (12/27/49), 16 repetition systems, 21 materials, 27 details.
+- Open, documented: rowboat hull still a round lathe bowl; rock albedo paler than the reference;
+  cottage ridge ~0.25 high; per-pass tier-1 silhouette IoU stays below the 0.85 threshold for this
+  diorama against a fully rendered reference (0.57–0.66, v1 was 0.66–0.70 at the same framing).

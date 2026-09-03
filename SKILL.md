@@ -1,4 +1,4 @@
-> Last updated: 2026-09-01 03:30
+> Last updated: 2026-09-03 21:40
 
 ---
 name: img2threejs
@@ -127,7 +127,9 @@ Full flags: `grimoire/scripts.md`. Never let a script *score* visuals — that i
     explicitly mapped component measurements. Extraction always starts at scope `none`; a separate
     human approval binds GLB/evidence/review/scope/spec hashes before a reversible proposed spec is
     emitted. The source image stays authoritative and the runtime stays code-only; merged meshes are
-    capped at global massing. Full contract: `docs/integrations/trellis-dense-evidence.md`.
+    capped at global massing unless you author a GLB-hash-bound `region-selectors.json`
+    (`--region-selectors`) that names the regions to measure. Full contract:
+    `docs/integrations/trellis-dense-evidence.md`.
 2. **Pre-Spec Assessment Gate** — classify + score complexity + write the quality contract:
    `forge/stage2_spec/new_pre_spec_assessment.py "Name" --image <img> --complexity <simple|moderate|complex|ultra-complex> --out assessment.json`. Rules: `grimoire/intake/quality_contract.md`.
    Set `objectClass.primaryDomain` (`object` | `character` | `hybrid`) and fill the seeded

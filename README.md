@@ -1,4 +1,4 @@
-> Last updated: 2026-09-01 21:55
+> Last updated: 2026-09-03 21:40
 
 <div align="center">
 
@@ -301,8 +301,10 @@ Install its isolated optional dependencies with `uv sync --project integrations/
 ### Optional offline dense evidence
 
 An admitted cached proxy can be converted into bounded dense evidence for a reversible spec
-proposal. Merged meshes are limited to global massing; component measurements require explicit
-human-reviewed mappings and a hash-bound influence approval. The source image remains authoritative,
+proposal. Merged meshes are limited to global massing unless an authored, GLB-hash-bound region
+selectors file crops reviewed regions out of them; component measurements (dimensions, lathe
+profile radii, strut radii, mirrored onto the attachment segment and the children's offsets)
+require explicit human-reviewed mappings and a hash-bound influence approval. The source image remains authoritative,
 and the accepted runtime remains code-only TypeScript/Three.js with no GLB/OBJ loader or provider
 artifact. The bridge performs no upload or provider call:
 [`docs/integrations/trellis-dense-evidence.md`](docs/integrations/trellis-dense-evidence.md).

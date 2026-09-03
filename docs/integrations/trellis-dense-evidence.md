@@ -1,4 +1,4 @@
-> Last updated: 2026-09-01 03:30
+> Last updated: 2026-09-03 21:40
 
 # TRELLIS dense-evidence bridge
 
@@ -20,17 +20,39 @@ Influence is deny-by-default and has exactly three levels:
 - `global-massing`: bounded whole-object dimensions and component positions may be proposed.
 - `component-measurements`: only explicitly mapped, observed component dimensions may be proposed.
 
-A merged one-mesh/one-primitive asset is capped at `global-massing`. Multipart node and primitive
-boundaries remain candidate selectors; names, materials, colors, connected components, and provider
-metadata never become semantic labels automatically. `component-measurements` requires a
-human-reviewed component map with confidence at least 0.80. Hidden and rear surfaces from a single
-view remain non-authoritative.
+A merged one-mesh/one-primitive asset is capped at `global-massing` unless an authored
+**region selectors** file is supplied. Multipart node and primitive boundaries remain candidate
+selectors; names, materials, colors, connected components, and provider metadata never become
+semantic labels automatically. `component-measurements` requires a human-reviewed component map
+with confidence at least 0.80. Hidden and rear surfaces from a single view remain non-authoritative.
+
+### Reviewed region selectors
+
+`region-selectors.json` (`kind: dense-evidence-region-selectors`, `glbSha256` bound to the
+normalized mesh) lists axis-aligned boxes in the **aligned** frame, each with a `semanticLabel`,
+`observedSurface: true`, an optional `profileAxis` and a `reviewNote`. The extractor crops the
+aligned point cloud with every box and emits a reviewed region (`reviewed: true`,
+`candidateOnly: false`, bounds, point count, and — when a profile axis is set — a radius-vs-station
+profile of at most 24 stations, each station the median of per-sector radial maxima). A crop with
+fewer than 64 points fails closed (`region_selector_empty`); a selectors file bound to another GLB
+fails with `evidence_hash_mismatch`; the selectors hash enters the cache identity and
+`extensions.reviewedRegions`. The semantic status becomes `reviewed-regions`, which reaches
+`component-measurements` under the same chirality and IoU thresholds as a multipart mesh. The
+reviewer does the labelling; the bridge only crops what was named.
+
+A component map may permit, per mapping: `dimensions.width/height/depth/radius/length`, and —
+only when the region carries a profile — `geometryDescriptor.latheProfile.radii` (measured radii
+resampled at the authored stations; heights never move) and `attachment.baseRadius/endRadius`
+(the profile's two ends). Every dimensional change is mirrored onto `transform.scale`, onto the
+attachment segment (`localEnd`) and radii of attachment-built primitives, and onto the direct
+children's parent-local offsets along that axis, each as its own derived, reversible delta entry —
+otherwise a measured number would sit in the JSON and never reach the generated geometry.
 
 The accepted ObjectSculptSpec is never overwritten. The bridge emits
 `proposed-object-sculpt-spec.json`, `spec-delta.json`, and `fit-plan.json`; the reverse delta must
-restore the accepted spec exactly. Version 1 cannot modify IDs, hierarchy, topology, primitive
-types, geometry descriptors, materials, pivots, sockets, attachments, repetition systems,
-interactions, or build passes.
+restore the accepted spec exactly. The bridge cannot modify IDs, hierarchy, topology, primitive
+types, materials, pivots, sockets, repetition systems, interactions, or build passes; the only
+geometry-descriptor field it may touch is the lathe profile's radius column.
 
 ## Pipeline order
 
@@ -92,6 +114,10 @@ uv run --project integrations/mesh3d python -m integrations.mesh3d.dense_evidenc
   --alignment reviewed-alignment.json \
   --out-dir RUN/dense-evidence
 ```
+
+All three commands accept `--region-selectors region-selectors.json` to add reviewed regions to a
+merged mesh (see *Reviewed region selectors* above); the file is copied next to the evidence and
+changes the cache key.
 
 Validate through the stdlib core:
 

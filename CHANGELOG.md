@@ -1,4 +1,4 @@
-> Last updated: 2026-09-03 10:40
+> Last updated: 2026-09-03 21:40
 
 # Changelog
 
@@ -37,6 +37,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit component mappings, hash-bound influence approval, source-authoritative A/B review,
   optional workflow routing, and code-only runtime guards; it never ships or copies provider mesh
   topology into the procedural factory.
+- Add reviewed region selectors to the dense-evidence bridge: an authored, GLB-hash-bound
+  `region-selectors.json` crops reviewed regions (bounds, point count, radius-vs-station profile
+  of at most 24 stations) out of a merged mesh, unlocking `component-measurements` on a one-node
+  TRELLIS result under the unchanged chirality/IoU thresholds. `apply_dense_evidence.py` now
+  applies `dimensions.radius`/`length` (they were permitted and skipped) and the profile-derived
+  `geometryDescriptor.latheProfile.radii` and `attachment.baseRadius/endRadius`
+  (`test_reviewed_regions.py`, `test_alignment_scope.py`, `test_apply_dense_evidence_component.py`).
+- Implement `repetitionSystems[].placement.mode` `linear` (`axis`, `spacing`, `start`, `centered`,
+  `rotation`) and `grid` (`axes`, `counts`, `spacing`); the mode was read, printed in a comment and
+  ignored by an always-radial loop. Unknown modes fail validation and codegen
+  (`test_repetition_placement_modes.py`, real-run matrices via `InstancedMesh.getMatrixAt`).
+- Emit `component.surfaceDetail` as a per-component material override (microRoughness →
+  roughness.variation, macroRoughness → roughness.base, bumpAmplitude → normal strength, and a
+  stone/plank/shingle/plaster/rope `surfaceFrequencyBands` preset resolved from an explicit
+  `preset` or the pattern prose existing specs already carry). It gated the surface-pass but never
+  reached codegen (`test_surface_detail_emission.py`).
+
+### Fixed
+
+- A dense-evidence proposal that moved `dimensions` alone never rendered: the generator reads
+  `transform.scale` first and builds cylinders/cones from `attachment.localStart/localEnd`. Every
+  dimensional change is now mirrored onto `transform.scale`, the attachment segment and radii, and
+  the direct children's parent-local offsets along that axis, each as a derived reversible delta.
+- Reviewed-region profiles take the median of per-sector radial maxima instead of a percentile
+  over all band points, which under-read a capped shell.
+- Materials authoring `emissive` as `{color, intensity}` (the template form) rendered black:
+  `readLayerColor` accepts both the string and the layer-object form (`test_emissive_layer.py`).
 
 ### Security
 

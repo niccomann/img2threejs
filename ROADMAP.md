@@ -1,4 +1,4 @@
-> Last updated: 2026-09-01 03:30
+> Last updated: 2026-09-03 21:40
 
 # img2threejs Roadmap
 
@@ -30,6 +30,15 @@ can plan around.
   explicitly mapped component measurements through hash-bound human approval, reversible spec
   deltas, dual-baseline review, and runtime guards. The shipped model remains code-only; provider
   topology and GLB/OBJ assets never become runtime dependencies.
+- **Reviewed region selectors and full component measurements** — an authored, GLB-hash-bound
+  selectors file crops reviewed regions (with radius-vs-station profiles) out of a merged mesh, so a
+  one-node TRELLIS result can reach `component-measurements`; radius, length, lathe-profile radii
+  and strut radii are applied and mirrored onto `transform.scale`, the attachment segment and the
+  children's offsets. Exercised end-to-end on Lighthouse Cove v2 (5 mapped components, A/B ALLOW).
+- **Generator features that were documented but dead** — `repetitionSystems[].placement.mode`
+  `linear`/`grid` now emit their own instance loops (unknown modes fail validation);
+  `component.surfaceDetail` is emitted as a per-component material override with five surface
+  presets; emissive layers authored as `{color, intensity}` reach the runtime.
 
 ### v1.2 — Humanoid character generator
 
