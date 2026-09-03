@@ -9,17 +9,22 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import dataclasses
+
 from . import EXTRACTOR_VERSION
 from .alignment import ALIGNMENT_PROFILE_VERSION, validate_alignment
 from .cache import ExtractionCacheInput, base_extraction_cache_key
-from .extract import ExtractionConfig, extract_run
+from .extract import ExtractionConfig, extract_run, measurement_config_payload
 from .model import (
+    SEMANTIC_STATUS_REVIEWED_REGIONS,
     DenseEvidenceError,
+    ProviderRun,
     canonical_sha256,
     load_json_object,
     validate_provider_run,
     write_json_atomic,
 )
+from .regions import validate_region_selectors
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,6 +37,11 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--run", type=Path, required=True)
         command.add_argument("--source-image", type=Path, action="append", required=True)
         command.add_argument("--alignment", type=Path, required=True)
+        command.add_argument(
+            "--region-selectors",
+            type=Path,
+            help="authored, GLB-hash-bound region selectors (unlocks component-measurements on a merged mesh)",
+        )
         if name != "propose-scope":
             command.add_argument("--out-dir", type=Path, required=True)
             command.add_argument("--resolution", type=int, default=24)
@@ -44,20 +54,31 @@ def _configuration(args: argparse.Namespace) -> ExtractionConfig:
     return ExtractionConfig(args.resolution, args.sections, args.max_section_points)
 
 
+def _reviewed_provider_run(
+    run: Path, source_images: tuple[Path, ...], region_selectors: dict[str, Any] | None
+) -> ProviderRun:
+    provider_run = validate_provider_run(run, source_images)
+    if region_selectors is not None:
+        validate_region_selectors(region_selectors, provider_run.glb_sha256)
+        provider_run = dataclasses.replace(
+            provider_run, semantic_status=SEMANTIC_STATUS_REVIEWED_REGIONS
+        )
+    return provider_run
+
+
 def _cache_identity(
     run: Path,
     source_images: tuple[Path, ...],
     alignment_payload: dict[str, Any],
     config: ExtractionConfig,
+    region_selectors: dict[str, Any] | None = None,
 ) -> tuple[str, Any, Any]:
     config.validate()
-    provider_run = validate_provider_run(run, source_images)
+    provider_run = _reviewed_provider_run(run, source_images, region_selectors)
     alignment = validate_alignment(alignment_payload, provider_run.semantic_status)
     measurement_hash = canonical_sha256(
         {
-            "resolution": config.resolution,
-            "sections": config.sections,
-            "maxSectionPoints": config.max_section_points,
+            **measurement_config_payload(config, region_selectors),
             "alignmentSha256": canonical_sha256(alignment_payload),
         }
     )
@@ -79,9 +100,10 @@ def _verify_cache(
     alignment_payload: dict[str, Any],
     out_dir: Path,
     config: ExtractionConfig,
+    region_selectors: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     expected_key, provider_run, _ = _cache_identity(
-        run, sources, alignment_payload, config
+        run, sources, alignment_payload, config, region_selectors
     )
     evidence_path = out_dir.expanduser().resolve() / "dense-evidence.v1.json"
     if not evidence_path.is_file():
@@ -119,8 +141,13 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = getattr(args, "out_dir", None)
     try:
         alignment_payload = load_json_object(args.alignment, "malformed_input")
+        region_selectors = (
+            load_json_object(args.region_selectors, "region_selector_invalid")
+            if getattr(args, "region_selectors", None)
+            else None
+        )
         if args.command == "propose-scope":
-            provider_run = validate_provider_run(args.run, sources)
+            provider_run = _reviewed_provider_run(args.run, sources, region_selectors)
             alignment = validate_alignment(alignment_payload, provider_run.semantic_status)
             print(
                 json.dumps(
@@ -137,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
 
         config = _configuration(args)
         cache_report = _verify_cache(
-            args.run, sources, alignment_payload, out_dir, config
+            args.run, sources, alignment_payload, out_dir, config, region_selectors
         )
         if args.command == "verify-cache":
             print(json.dumps(cache_report, ensure_ascii=False))
@@ -157,17 +184,19 @@ def main(argv: list[str] | None = None) -> int:
             "run": str(args.run.expanduser().resolve()),
             "sourceImages": [str(item.expanduser().resolve()) for item in sources],
             "alignmentSha256": canonical_sha256(alignment_payload),
-            "measurementConfig": {
-                "resolution": config.resolution,
-                "sections": config.sections,
-                "maxSectionPoints": config.max_section_points,
-            },
+            "measurementConfig": measurement_config_payload(config, region_selectors),
         }
         write_json_atomic(out_dir / "extraction-request.json", request)
         write_json_atomic(out_dir / "alignment.json", alignment_payload)
-        evidence = extract_run(args.run, sources, alignment_payload, out_dir, config)
+        if region_selectors is not None:
+            write_json_atomic(out_dir / "region-selectors.json", region_selectors)
+        evidence = extract_run(
+            args.run, sources, alignment_payload, out_dir, config, region_selectors
+        )
         # Use the CLI identity, which binds the exact alignment as well as numeric caps.
-        expected_key, _, _ = _cache_identity(args.run, sources, alignment_payload, config)
+        expected_key, _, _ = _cache_identity(
+            args.run, sources, alignment_payload, config, region_selectors
+        )
         evidence["cache"]["baseExtractionKey"] = expected_key
         evidence["cache"]["measurementConfigSha256"] = canonical_sha256(
             {**request["measurementConfig"], "alignmentSha256": request["alignmentSha256"]}

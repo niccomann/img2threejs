@@ -22,6 +22,13 @@ if str(ROOT) not in sys.path:
 from forge.stage1_intake.check_dense_evidence import validate_dense_evidence
 
 
+# The generator sizes a component from `transform.scale` when it is present and only falls
+# back to `dimensions` otherwise (generate_threejs_factory.py: resolve_component_scale /
+# scale_vector). A proposal that moved `dimensions` alone would therefore be cosmetic on every
+# spec that carries both -- the measured number would sit in the JSON and never reach the
+# geometry. Every dimensional change below is mirrored onto the matching `transform.scale`
+# axis, recorded as its own derived change so the reverse delta restores both.
+DERIVED_SCALE_FIELDS = ("transform.scale.0", "transform.scale.1", "transform.scale.2")
 GLOBAL_NUMERIC_FIELDS = frozenset(
     {
         "dimensions.width",
@@ -32,8 +39,12 @@ GLOBAL_NUMERIC_FIELDS = frozenset(
         "transform.position.0",
         "transform.position.1",
         "transform.position.2",
+        *DERIVED_SCALE_FIELDS,
     }
 )
+# Fields a component map may permit (mirror of check_dense_evidence.COMPONENT_FIELDS) plus the
+# derived scale mirrors. The three profile-derived fields need a reviewed region carrying a
+# radius-vs-station `profile`; heights/stations are never moved, only radii.
 COMPONENT_NUMERIC_FIELDS = frozenset(
     {
         "dimensions.width",
@@ -41,8 +52,14 @@ COMPONENT_NUMERIC_FIELDS = frozenset(
         "dimensions.depth",
         "dimensions.radius",
         "dimensions.length",
+        "geometryDescriptor.latheProfile.radii",
+        "attachment.baseRadius",
+        "attachment.endRadius",
+        *DERIVED_SCALE_FIELDS,
     }
 )
+COMPONENT_PERMITTED_FIELDS = COMPONENT_NUMERIC_FIELDS - frozenset(DERIVED_SCALE_FIELDS)
+AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
 
 
 def _canonical_sha256(value: object) -> str:
@@ -137,6 +154,8 @@ def _set_change(
     measured: float,
     confidence: float,
     source_region: str,
+    field_label: str | None = None,
+    derived_from: str | None = None,
 ) -> None:
     tokens: list[object] = field.split(".")
     resolved_tokens: list[object] = []
@@ -175,20 +194,49 @@ def _set_change(
         else:
             target[int(final)] = old
         return
-    changes.append(
-        {
-            "path": [*path, *resolved_tokens, resolved_final],
-            "componentId": component.get("id"),
-            "field": field,
-            "old": float(old),
-            "new": float(new_value),
-            "measured": float(measured),
-            "confidence": float(confidence),
-            "sourceRegion": source_region,
-            "scope": scope,
-            "reason": "bounded dense-evidence measurement proposal",
-        }
-    )
+    change: dict[str, object] = {
+        "path": [*path, *resolved_tokens, resolved_final],
+        "componentId": component.get("id"),
+        "field": field_label or field,
+        "old": float(old),
+        "new": float(new_value),
+        "measured": float(measured),
+        "confidence": float(confidence),
+        "sourceRegion": source_region,
+        "scope": scope,
+        "reason": "bounded dense-evidence measurement proposal",
+    }
+    if derived_from is not None:
+        change["derivedFrom"] = derived_from
+        change["reason"] = "transform.scale mirrors the dimensional change (generator reads scale first)"
+    changes.append(change)
+
+
+def _sync_transform_scale(
+    component: dict[str, Any],
+    path: list[object],
+    axes: tuple[int, ...],
+    factor: float,
+    changes: list[dict[str, object]],
+    *,
+    scope: str,
+    measured: float,
+    confidence: float,
+    source_region: str,
+    derived_from: str,
+) -> None:
+    transform = component.get("transform")
+    scale = transform.get("scale") if isinstance(transform, dict) else None
+    if not isinstance(scale, list) or len(scale) != 3:
+        return
+    for axis in axes:
+        value = scale[axis]
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            _set_change(
+                component, path, f"transform.scale.{axis}", float(value) * factor, changes,
+                scope=scope, measured=measured, confidence=confidence, source_region=source_region,
+                derived_from=derived_from,
+            )
 
 
 def _validate_binding(
@@ -251,6 +299,8 @@ def _global_proposal(
                 value = dimensions.get(field.split(".")[-1])
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     _set_change(component, path, field, float(value) * factor, changes, scope="global-massing", measured=measurement, confidence=0.8, source_region="global")
+                    axis = {"dimensions.width": 0, "dimensions.height": 1, "dimensions.depth": 2}[field]
+                    _sync_transform_scale(component, path, (axis,), factor, changes, scope="global-massing", measured=measurement, confidence=0.8, source_region="global", derived_from=field)
             radius = dimensions.get("radius")
             if isinstance(radius, (int, float)) and not isinstance(radius, bool):
                 _set_change(component, path, "dimensions.radius", float(radius) * ((scale[0] + scale[2]) / 2.0), changes, scope="global-massing", measured=(float(measured[0]) + float(measured[2])) / 2.0, confidence=0.75, source_region="global")
@@ -280,7 +330,7 @@ def _component_proposal(
             for mapping in mappings:
                 fields = mapping.get("permittedFields") if isinstance(mapping, dict) else None
                 if isinstance(fields, list) and any(
-                    field not in COMPONENT_NUMERIC_FIELDS for field in fields
+                    field not in COMPONENT_PERMITTED_FIELDS for field in fields
                 ):
                     raise ValueError(
                         "influence_scope_exceeded: component field is forbidden"
@@ -297,24 +347,181 @@ def _component_proposal(
         for item in evidence.get("regions", [])
         if isinstance(item, dict)
     }
+    maximum_delta = _max_delta(proposal)
     for mapping in component_map.get("mappings", []):
         fields = mapping.get("permittedFields", [])
-        if any(field not in COMPONENT_NUMERIC_FIELDS for field in fields):
+        if any(field not in COMPONENT_PERMITTED_FIELDS for field in fields):
             raise ValueError("influence_scope_exceeded: component field is forbidden")
         component, path = components[str(mapping["componentId"])]
         region = regions[str(mapping["selectors"][0]["regionId"])]
-        size = region["bounds"]["size"]
+        size = [float(value) for value in region["bounds"]["size"]]
         dimensions = component.get("dimensions", {})
+        common = {
+            "scope": "component-measurements",
+            "confidence": float(mapping["confidence"]),
+            "source_region": str(region["regionId"]),
+        }
+
+        def numeric(value: object) -> float | None:
+            return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
         for field in fields:
             key = field.split(".")[-1]
-            if key not in {"width", "height", "depth"}:
-                continue
-            axis = {"width": 0, "height": 1, "depth": 2}[key]
-            old = dimensions.get(key)
-            if not isinstance(old, (int, float)) or isinstance(old, bool):
-                continue
-            factor = bounded_ratio(float(size[axis]), float(old), _max_delta(proposal))
-            _set_change(component, path, field, float(old) * factor, changes, scope="component-measurements", measured=float(size[axis]), confidence=float(mapping["confidence"]), source_region=str(region["regionId"]))
+            if field in {"dimensions.width", "dimensions.height", "dimensions.depth"}:
+                axis = {"width": 0, "height": 1, "depth": 2}[key]
+                old = numeric(dimensions.get(key))
+                if old is None:
+                    continue
+                factor = bounded_ratio(size[axis], old, maximum_delta)
+                _set_change(component, path, field, old * factor, changes, measured=size[axis], **common)
+                _sync_transform_scale(component, path, (axis,), factor, changes, measured=size[axis], derived_from=field, **common)
+            elif field == "dimensions.radius":
+                # Mean of the region's lateral extents, halved: a cylinder's radius, robust to a
+                # slightly elliptical crop.
+                old = numeric(dimensions.get("radius"))
+                if old is None:
+                    continue
+                measured = (size[0] + size[2]) / 4.0
+                factor = bounded_ratio(measured, old, maximum_delta)
+                _set_change(component, path, field, old * factor, changes, measured=measured, **common)
+                _sync_transform_scale(component, path, (0, 2), factor, changes, measured=measured, derived_from=field, **common)
+            elif field == "dimensions.length":
+                old = numeric(dimensions.get("length"))
+                if old is None:
+                    continue
+                dominant = component.get("dominantAxis")
+                axis = AXIS_INDEX[str(dominant)] if dominant in AXIS_INDEX else max(range(3), key=lambda i: size[i])
+                factor = bounded_ratio(size[axis], old, maximum_delta)
+                _set_change(component, path, field, old * factor, changes, measured=size[axis], **common)
+                _sync_transform_scale(component, path, (axis,), factor, changes, measured=size[axis], derived_from=field, **common)
+            elif field == "geometryDescriptor.latheProfile.radii":
+                _lathe_profile_proposal(component, path, region, changes, maximum_delta, common)
+            elif field in {"attachment.baseRadius", "attachment.endRadius"}:
+                _attachment_radius_proposal(component, path, region, field, changes, maximum_delta, common)
+
+
+def _profile_stations(region: dict[str, Any]) -> list[tuple[float, float]]:
+    stations = [
+        (float(item[0]), float(item[1]))
+        for item in region.get("profile", [])
+        if isinstance(item, list) and len(item) == 2
+    ]
+    stations.sort(key=lambda item: item[0])
+    return stations
+
+
+def _interpolate_radius(stations: list[tuple[float, float]], position: float) -> float:
+    if position <= stations[0][0]:
+        return stations[0][1]
+    if position >= stations[-1][0]:
+        return stations[-1][1]
+    for (p0, r0), (p1, r1) in zip(stations, stations[1:]):
+        if p0 <= position <= p1:
+            t = 0.0 if p1 == p0 else (position - p0) / (p1 - p0)
+            return r0 + (r1 - r0) * t
+    return stations[-1][1]
+
+
+def _lateral_scale(component: dict[str, Any]) -> float | None:
+    """World units per unit-lathe radius: the mean lateral transform.scale (or dimensions)."""
+    transform = component.get("transform")
+    scale = transform.get("scale") if isinstance(transform, dict) else None
+    if isinstance(scale, list) and len(scale) == 3 and all(
+        isinstance(v, (int, float)) and not isinstance(v, bool) for v in scale
+    ):
+        lateral = (float(scale[0]) + float(scale[2])) / 2.0
+        return lateral if lateral > 0 else None
+    dimensions = component.get("dimensions")
+    if isinstance(dimensions, dict):
+        width = dimensions.get("width")
+        depth = dimensions.get("depth")
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (width, depth)):
+            lateral = (float(width) + float(depth)) / 2.0
+            return lateral if lateral > 0 else None
+    return None
+
+
+def _lathe_profile_proposal(
+    component: dict[str, Any],
+    path: list[object],
+    region: dict[str, Any],
+    changes: list[dict[str, object]],
+    maximum_delta: float,
+    common: dict[str, Any],
+) -> None:
+    """Resample the region's measured radius at every authored lathe station.
+
+    Authored `latheProfile.points` are [radius, height] in the component's unit frame
+    (radius 0..0.5, height -0.5..0.5) and the generator scales them by transform.scale, so the
+    measured world radius is divided by the lateral scale before comparison. Heights are the
+    authored ones -- only the radius column changes, each station bounded on its own.
+    """
+    stations = _profile_stations(region)
+    descriptor = component.get("geometryDescriptor")
+    profile = descriptor.get("latheProfile") if isinstance(descriptor, dict) else None
+    points = profile.get("points") if isinstance(profile, dict) else None
+    lateral = _lateral_scale(component)
+    if len(stations) < 2 or not isinstance(points, list) or lateral is None:
+        return
+    heights = [
+        float(point[1]) for point in points
+        if isinstance(point, list) and len(point) == 2 and isinstance(point[1], (int, float))
+    ]
+    if len(heights) < 2 or max(heights) - min(heights) <= 1e-12:
+        return
+    low, high = min(heights), max(heights)
+    station_low, station_high = stations[0][0], stations[-1][0]
+    for index, point in enumerate(points):
+        if not (isinstance(point, list) and len(point) == 2):
+            continue
+        radius = point[0]
+        if not isinstance(radius, (int, float)) or isinstance(radius, bool) or float(radius) <= 0:
+            continue
+        t = (float(point[1]) - low) / (high - low)
+        measured_world = _interpolate_radius(stations, station_low + t * (station_high - station_low))
+        measured_unit = measured_world / lateral
+        factor = bounded_ratio(measured_unit, float(radius), maximum_delta)
+        _set_change(
+            component, path, f"geometryDescriptor.latheProfile.points.{index}.0", float(radius) * factor, changes,
+            measured=measured_unit, field_label="geometryDescriptor.latheProfile.radii", **common,
+        )
+
+
+def _attachment_radius_proposal(
+    component: dict[str, Any],
+    path: list[object],
+    region: dict[str, Any],
+    field: str,
+    changes: list[dict[str, object]],
+    maximum_delta: float,
+    common: dict[str, Any],
+) -> None:
+    """Strut radii from the two ends of the region profile.
+
+    `base` is the localStart end and `end` the localEnd end of the attachment; when the
+    attachment does not say which way it runs along the profile axis, base is the low station.
+    """
+    stations = _profile_stations(region)
+    attachment = component.get("attachment")
+    if len(stations) < 2 or not isinstance(attachment, dict):
+        return
+    key = field.split(".")[-1]
+    old = attachment.get(key)
+    if not isinstance(old, (int, float)) or isinstance(old, bool) or float(old) <= 0:
+        return
+    axis = AXIS_INDEX.get(str(region.get("profileAxis")), 1)
+    start = attachment.get("localStart")
+    end = attachment.get("localEnd")
+    base_is_low = True
+    if isinstance(start, list) and isinstance(end, list) and len(start) == 3 and len(end) == 3:
+        try:
+            base_is_low = float(start[axis]) <= float(end[axis])
+        except (TypeError, ValueError):
+            base_is_low = True
+    low_radius, high_radius = stations[0][1], stations[-1][1]
+    measured = (low_radius if base_is_low else high_radius) if key == "baseRadius" else (high_radius if base_is_low else low_radius)
+    factor = bounded_ratio(measured, float(old), maximum_delta)
+    _set_change(component, path, field, float(old) * factor, changes, measured=measured, **common)
 
 
 def build_proposal(

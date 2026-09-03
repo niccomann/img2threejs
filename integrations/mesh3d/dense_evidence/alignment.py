@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .model import DenseEvidenceError, InfluenceScope, finite_number
+from .model import (
+    COMPONENT_CAPABLE_SEMANTIC_STATUSES,
+    DenseEvidenceError,
+    InfluenceScope,
+    finite_number,
+)
 
 
 ALIGNMENT_PROFILE_VERSION = "source-view-alignment-v1"
@@ -39,7 +44,7 @@ def _maximum_scope(
             "alignment_failed", "source-view thresholds were not met"
         )
     if (
-        semantic_status == "sufficient"
+        semantic_status in COMPONENT_CAPABLE_SEMANTIC_STATUSES
         and chirality_status == "reviewed"
         and iou >= MIN_COMPONENT_IOU
     ):

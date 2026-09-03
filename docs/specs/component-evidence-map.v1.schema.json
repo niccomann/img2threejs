@@ -25,10 +25,10 @@
       "properties": {
         "componentId": {"type": "string", "minLength": 1},
         "selectors": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["regionId"], "properties": {"regionId": {"type": "string", "minLength": 1}}}},
-        "mappingMethod": {"const": "human-reviewed-node-boundary"},
+        "mappingMethod": {"enum": ["human-reviewed-node-boundary", "human-reviewed-region-selector"]},
         "evidenceRefs": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
         "confidence": {"type": "number", "minimum": 0.8, "maximum": 1.0},
-        "permittedFields": {"type": "array", "minItems": 1, "items": {"enum": ["dimensions.width", "dimensions.height", "dimensions.depth", "dimensions.radius", "dimensions.length"]}},
+        "permittedFields": {"type": "array", "minItems": 1, "items": {"enum": ["dimensions.width", "dimensions.height", "dimensions.depth", "dimensions.radius", "dimensions.length", "geometryDescriptor.latheProfile.radii", "attachment.baseRadius", "attachment.endRadius"]}},
         "observedSurface": {"const": true},
         "hiddenLimitations": {"type": "array", "items": {"type": "string"}}
       }

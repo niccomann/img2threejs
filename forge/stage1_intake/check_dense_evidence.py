@@ -15,13 +15,32 @@ from typing import Any
 SCOPES = ("none", "global-massing", "component-measurements")
 SCOPE_RANK = {value: index for index, value in enumerate(SCOPES)}
 HASH_FIELDS = ("glbSha256", "objSha256", "alignmentSha256")
+# Semantic statuses (mirror of integrations/mesh3d/dense_evidence/model.py). Only the first
+# two can carry component-measurements scope; "reviewed-regions" additionally needs at least
+# one reviewed region and the selectors hash binding in extensions.reviewedRegions.
+SEMANTIC_STATUSES = ("sufficient", "reviewed-regions", "insufficient")
+COMPONENT_CAPABLE_SEMANTIC_STATUSES = frozenset({"sufficient", "reviewed-regions"})
+# Fields a component map may permit. The profile-derived ones need a reviewed region that
+# carries a `profile`; they resample measured radii at the authored stations (see
+# apply_dense_evidence.py) and never move authored heights.
 COMPONENT_FIELDS = {
     "dimensions.width",
     "dimensions.height",
     "dimensions.depth",
     "dimensions.radius",
     "dimensions.length",
+    "geometryDescriptor.latheProfile.radii",
+    "attachment.baseRadius",
+    "attachment.endRadius",
 }
+PROFILE_COMPONENT_FIELDS = {
+    "geometryDescriptor.latheProfile.radii",
+    "attachment.baseRadius",
+    "attachment.endRadius",
+}
+REVIEWED_REGION_PREFIX = "reviewed:"
+MIN_REGION_POINTS = 64
+MAX_PROFILE_STATIONS = 24
 TOP_LEVEL_FIELDS = {
     "schemaVersion",
     "kind",
@@ -261,11 +280,12 @@ def _validate_component_map(
     if not isinstance(provenance, dict) or component_map.get("glbSha256") != provenance.get("glbSha256"):
         _failure(errors, categories, "evidence_hash_mismatch", "component map GLB hash drift")
     component_ids = _component_ids(spec)
-    region_ids = {
-        item.get("regionId")
+    regions_by_id = {
+        item["regionId"]: item
         for item in evidence.get("regions", [])
         if isinstance(item, dict) and isinstance(item.get("regionId"), str)
     }
+    region_ids = set(regions_by_id)
     used_selectors: set[str] = set()
     mappings = component_map.get("mappings")
     if not isinstance(mappings, list):
@@ -297,6 +317,92 @@ def _validate_component_map(
                 _failure(errors, categories, "component_mapping_invalid", "selector is unknown or duplicated")
             if isinstance(region_id, str):
                 used_selectors.add(region_id)
+        if isinstance(fields, list) and any(field in PROFILE_COMPONENT_FIELDS for field in fields):
+            first = selectors[0].get("regionId") if isinstance(selectors[0], dict) else None
+            region = regions_by_id.get(first) if isinstance(first, str) else None
+            if not isinstance(region, dict) or not isinstance(region.get("profile"), list) or len(region["profile"]) < 2:
+                _failure(
+                    errors,
+                    categories,
+                    "component_mapping_invalid",
+                    "profile-derived fields need a reviewed region with a profile",
+                )
+
+
+def _is_candidate_region(item: object) -> bool:
+    return (
+        isinstance(item, dict)
+        and item.get("candidateOnly") is True
+        and item.get("semanticLabel") is None
+    )
+
+
+def _validate_reviewed_region(item: dict[str, object], errors: list[str], categories: set[str]) -> None:
+    region_id = item.get("regionId")
+    if not isinstance(region_id, str) or not region_id.startswith(REVIEWED_REGION_PREFIX):
+        _failure(errors, categories, "schema_invalid", "reviewed region id must start with 'reviewed:'")
+    if item.get("reviewed") is not True or item.get("candidateOnly") is not False or item.get("observedSurface") is not True:
+        _failure(errors, categories, "schema_invalid", "reviewed region flags are invalid")
+    label = item.get("semanticLabel")
+    if not isinstance(label, str) or not label.strip():
+        _failure(errors, categories, "schema_invalid", "reviewed region needs a semanticLabel")
+    bounds = item.get("bounds")
+    if not isinstance(bounds, dict) or any(
+        not isinstance(bounds.get(field), list) or len(bounds[field]) != 3 or not all(_finite(v) for v in bounds[field])
+        for field in ("min", "max", "size")
+    ):
+        _failure(errors, categories, "schema_invalid", "reviewed region bounds must be finite xyz")
+    elif any(float(v) <= 0 for v in bounds["size"]):
+        _failure(errors, categories, "degenerate_geometry", "reviewed region size must be positive")
+    count = item.get("pointCount")
+    if not isinstance(count, int) or isinstance(count, bool) or count < MIN_REGION_POINTS:
+        _failure(errors, categories, "region_selector_empty", "reviewed region has too few points")
+    profile = item.get("profile")
+    if profile is not None:
+        if item.get("profileAxis") not in {"x", "y", "z"}:
+            _failure(errors, categories, "schema_invalid", "profile needs a profileAxis")
+        if not isinstance(profile, list) or len(profile) > MAX_PROFILE_STATIONS:
+            _failure(errors, categories, "measurement_limit_exceeded", "region profile exceeds 24 stations")
+        elif not all(
+            isinstance(station, list) and len(station) == 2 and _finite(station[0]) and _finite(station[1]) and float(station[1]) >= 0
+            for station in profile
+        ):
+            _failure(errors, categories, "schema_invalid", "profile stations must be [position, radius]")
+
+
+def _validate_regions(evidence: dict[str, object], errors: list[str], categories: set[str]) -> int:
+    """Validate regions; return the number of reviewed regions."""
+    regions = evidence.get("regions")
+    if not isinstance(regions, list):
+        _failure(errors, categories, "schema_invalid", "regions must be a list")
+        return 0
+    reviewed_count = 0
+    for item in regions:
+        if _is_candidate_region(item):
+            continue
+        if isinstance(item, dict) and item.get("reviewed") is True:
+            reviewed_count += 1
+            _validate_reviewed_region(item, errors, categories)
+            continue
+        _failure(errors, categories, "schema_invalid", "regions must remain candidate-only")
+    if reviewed_count:
+        extensions = evidence.get("extensions")
+        binding = extensions.get("reviewedRegions") if isinstance(extensions, dict) else None
+        provenance = evidence.get("provenance")
+        glb = provenance.get("glbSha256") if isinstance(provenance, dict) else None
+        if (
+            not isinstance(binding, dict)
+            or not _is_hash(binding.get("selectorsSha256"))
+            or binding.get("glbSha256") != glb
+            or binding.get("count") != reviewed_count
+        ):
+            _failure(
+                errors,
+                categories,
+                "evidence_hash_mismatch",
+                "reviewed regions need extensions.reviewedRegions bound to the GLB",
+            )
+    return reviewed_count
 
 
 def validate_dense_evidence(
@@ -351,7 +457,10 @@ def validate_dense_evidence(
             approved_scope = admission.get("approvedInfluenceScope")
             if maximum_scope not in SCOPES or approved_scope != "none":
                 _failure(errors, categories, "schema_invalid", "evidence scope contract is invalid")
-            if admission.get("semanticStatus") == "insufficient" and maximum_scope == "component-measurements":
+            semantic_status = admission.get("semanticStatus")
+            if semantic_status not in SEMANTIC_STATUSES:
+                _failure(errors, categories, "schema_invalid", "evidence semanticStatus is invalid")
+            if semantic_status not in COMPONENT_CAPABLE_SEMANTIC_STATUSES and maximum_scope == "component-measurements":
                 _failure(
                     errors,
                     categories,
@@ -362,14 +471,18 @@ def validate_dense_evidence(
         if not isinstance(uncertainty, dict) or uncertainty.get("hiddenSurfacePolicy") != "non-authoritative":
             _failure(errors, categories, "schema_invalid", "hidden surfaces must be non-authoritative")
         _validate_global_geometry(evidence.get("globalGeometry"), errors, categories)
-        regions = evidence.get("regions")
-        if not isinstance(regions, list) or any(
-            not isinstance(item, dict)
-            or item.get("candidateOnly") is not True
-            or item.get("semanticLabel") is not None
-            for item in regions if isinstance(regions, list)
+        reviewed_count = _validate_regions(evidence, errors, categories)
+        if (
+            isinstance(admission, dict)
+            and admission.get("semanticStatus") == "reviewed-regions"
+            and reviewed_count == 0
         ):
-            _failure(errors, categories, "schema_invalid", "regions must remain candidate-only")
+            _failure(
+                errors,
+                categories,
+                "semantic_boundary_insufficient",
+                "reviewed-regions status requires at least one reviewed region",
+            )
         if component_map is not None:
             _validate_component_map(
                 evidence, expected_spec, component_map, errors, categories

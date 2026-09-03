@@ -25,6 +25,15 @@ SCOPE_RANK = {
     InfluenceScope.COMPONENT_MEASUREMENTS: 2,
 }
 
+# Semantic statuses that can carry component-measurements scope. "sufficient" comes from a
+# multipart provider mesh (explicit node boundaries); "reviewed-regions" comes from an
+# authored, GLB-hash-bound region selectors file cropping a merged mesh (see regions.py).
+SEMANTIC_STATUS_SUFFICIENT = "sufficient"
+SEMANTIC_STATUS_REVIEWED_REGIONS = "reviewed-regions"
+COMPONENT_CAPABLE_SEMANTIC_STATUSES = frozenset(
+    {SEMANTIC_STATUS_SUFFICIENT, SEMANTIC_STATUS_REVIEWED_REGIONS}
+)
+
 
 class DenseEvidenceError(RuntimeError):
     def __init__(self, category: str, message: str):
